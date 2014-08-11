@@ -27,6 +27,7 @@
 #include <linux/slab.h>
 #include <linux/regulator/consumer.h>
 #include <linux/gpio.h>
+#include <linux/input.h>
 #ifdef CONFIG_HAS_EARLYSUSPEND
 #include <linux/earlysuspend.h>
 #endif
@@ -2427,6 +2428,9 @@ static int mxt_initialize_t100_input_device(struct mxt_data *data)
 	input_dev->close = mxt_input_close;
 
 	set_bit(EV_ABS, input_dev->evbit);
+#ifdef INPUT_PROP_DIRECT
+	set_bit(INPUT_PROP_DIRECT, input_dev->propbit);
+#endif
 	input_set_capability(input_dev, EV_KEY, BTN_TOUCH);
 
 	/* For single touch */
