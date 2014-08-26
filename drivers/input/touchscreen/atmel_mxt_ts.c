@@ -2204,8 +2204,8 @@ static int mxt_read_t9_resolution(struct mxt_data *data)
 	return 0;
 }
 
-static void mxt_start(struct mxt_data *data);
-static void mxt_stop(struct mxt_data *data);
+static int mxt_start(struct mxt_data *data);
+static int mxt_stop(struct mxt_data *data);
 static int mxt_input_open(struct input_dev *dev);
 static void mxt_input_close(struct input_dev *dev);
 
@@ -3103,10 +3103,12 @@ static void mxt_reset_slots(struct mxt_data *data)
 	mxt_input_sync(data);
 }
 
-static void mxt_start(struct mxt_data *data)
+static int mxt_start(struct mxt_data *data)
 {
+	int error = 0;
+
 	if (!data->suspended || data->in_bootloader)
-		return;
+		return 0;
 
 	if (data->use_regulator) {
 		enable_irq(data->irq);
@@ -3119,7 +3121,7 @@ static void mxt_start(struct mxt_data *data)
 		 */
 		mxt_process_messages_until_invalid(data);
 
-		mxt_set_t7_power_cfg(data, MXT_POWER_CFG_RUN);
+		error = mxt_set_t7_power_cfg(data, MXT_POWER_CFG_RUN);
 
 		/* Recalibrate since chip has been in deep sleep */
 		mxt_t6_command(data, MXT_COMMAND_CALIBRATE, 1, false);
@@ -3128,22 +3130,28 @@ static void mxt_start(struct mxt_data *data)
 	}
 
 	data->suspended = false;
+
+	return error;
 }
 
-static void mxt_stop(struct mxt_data *data)
+static int mxt_stop(struct mxt_data *data)
 {
+	int error = 0;
+
 	if (data->suspended || data->in_bootloader || data->updating_config)
-		return;
+		return 0;
 
 	disable_irq(data->irq);
 
 	if (data->use_regulator)
 		mxt_regulator_disable(data);
 	else
-		mxt_set_t7_power_cfg(data, MXT_POWER_CFG_DEEPSLEEP);
+		error =	mxt_set_t7_power_cfg(data, MXT_POWER_CFG_DEEPSLEEP);
 
 	mxt_reset_slots(data);
 	data->suspended = true;
+
+	return error;
 }
 
 static int mxt_input_open(struct input_dev *dev)
@@ -3341,14 +3349,21 @@ static int mxt_remove(struct i2c_client *client)
 #ifdef CONFIG_PM_SLEEP
 static int mxt_suspend(struct device *dev)
 {
+	int error;
 	struct i2c_client *client = to_i2c_client(dev);
 	struct mxt_data *data = i2c_get_clientdata(client);
 	struct input_dev *input_dev = data->input_dev;
 
 	mutex_lock(&input_dev->mutex);
 
-	if (input_dev->users)
-		mxt_stop(data);
+	if (input_dev->users) {
+		error = mxt_stop(data);
+		if (error < 0) {
+			dev_err(dev, "mxt_stop failed in suspend\n");
+			mutex_unlock(&input_dev->mutex);
+			return error;
+		}
+	}
 
 	mutex_unlock(&input_dev->mutex);
 
@@ -3357,14 +3372,21 @@ static int mxt_suspend(struct device *dev)
 
 static int mxt_resume(struct device *dev)
 {
+	int error;
 	struct i2c_client *client = to_i2c_client(dev);
 	struct mxt_data *data = i2c_get_clientdata(client);
 	struct input_dev *input_dev = data->input_dev;
 
 	mutex_lock(&input_dev->mutex);
 
-	if (input_dev->users)
-		mxt_start(data);
+	if (input_dev->users) {
+		error = mxt_start(data);
+		if (error < 0) {
+			dev_err(dev, "mxt_start failed in resume\n");
+			mutex_unlock(&input_dev->mutex);
+			return error;
+		}
+	}
 
 	mutex_unlock(&input_dev->mutex);
 
