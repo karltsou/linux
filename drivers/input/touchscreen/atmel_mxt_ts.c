@@ -41,6 +41,10 @@
 #include <linux/of_gpio.h>
 #endif
 
+#include <linux/version.h>
+#if (LINUX_VERSION_CODE > KERNEL_VERSION(3, 6, 8))
+#define KERNEL_3_6_8_ABOVE
+#endif
 /* Configuration file */
 #define MXT_CFG_MAGIC		"OBP_RAW V1"
 
@@ -2282,7 +2286,11 @@ static int mxt_initialize_t9_input_device(struct mxt_data *data)
 
 	/* For multi touch */
 	num_mt_slots = data->num_touchids + data->num_stylusids;
+#ifdef KERNEL_3_6_8_ABOVE
+	error = input_mt_init_slots(input_dev, num_mt_slots, INPUT_MT_DIRECT);
+#else
 	error = input_mt_init_slots(input_dev, num_mt_slots);
+#endif
 	if (error) {
 		dev_err(dev, "Error %d initialising slots\n", error);
 		goto err_free_mem;
@@ -2455,7 +2463,11 @@ static int mxt_initialize_t100_input_device(struct mxt_data *data)
 				     0, 255, 0, 0);
 
 	/* For multi touch */
+#ifdef KERNEL_3_6_8_ABOVE
+	error = input_mt_init_slots(input_dev, data->num_touchids, INPUT_MT_DIRECT);
+#else
 	error = input_mt_init_slots(input_dev, data->num_touchids);
+#endif
 	if (error) {
 		dev_err(dev, "Error %d initialising slots\n", error);
 		goto err_free_mem;
