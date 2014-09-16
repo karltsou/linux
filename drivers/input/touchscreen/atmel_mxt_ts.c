@@ -1009,6 +1009,8 @@ static void mxt_proc_t100_message(struct mxt_data *data, u8 *message)
 
 		/* Touch active */
 		input_mt_report_slot_state(input_dev, tool, 1);
+		input_report_key(input_dev, BTN_TOUCH, 1);
+		input_report_key(input_dev, BTN_TOOL_FINGER, 1);
 		input_report_abs(input_dev, ABS_MT_POSITION_X, x);
 		input_report_abs(input_dev, ABS_MT_POSITION_Y, y);
 
