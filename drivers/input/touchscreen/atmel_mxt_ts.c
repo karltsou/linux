@@ -246,7 +246,7 @@ struct mxt_data {
 	struct i2c_client *client;
 	struct input_dev *input_dev;
 	char phys[64];		/* device physical location */
-	struct mxt_platform_data *pdata;
+	const struct mxt_platform_data *pdata;
 	struct mxt_object *object_table;
 	struct mxt_info *info;
 	void *raw_info_block;
@@ -269,12 +269,12 @@ struct mxt_data {
 	u32 config_crc;
 	u32 info_crc;
 	u8 bootloader_addr;
-	struct t7_config t7_cfg;
 	u8 *msg_buf;
 	u8 t6_status;
 	bool update_input;
 	u8 last_message_count;
 	u8 num_touchids;
+	struct t7_config t7_cfg;
 	u8 num_stylusids;
 	unsigned long t15_keystatus;
 	bool use_retrigen_workaround;
@@ -607,20 +607,20 @@ static int mxt_lookup_bootloader_address(struct mxt_data *data, bool retry)
 	return 0;
 }
 
-static int mxt_probe_bootloader(struct mxt_data *data, bool retry)
+static int mxt_probe_bootloader(struct mxt_data *data, bool alt_address)
 {
 	struct device *dev = &data->client->dev;
-	int ret;
+	int error;
 	u8 val;
 	bool crc_failure;
 
-	ret = mxt_lookup_bootloader_address(data, retry);
-	if (ret)
-		return ret;
+	error = mxt_lookup_bootloader_address(data, alt_address);
+	if (error)
+		return error;
 
-	ret = mxt_bootloader_read(data, &val, 1);
-	if (ret)
-		return ret;
+	error = mxt_bootloader_read(data, &val, 1);
+	if (error)
+		return error;
 
 	/* Check app crc fail mode */
 	crc_failure = (val & ~MXT_BOOT_STATUS_MASK) == MXT_APP_CRC_FAIL;
@@ -841,12 +841,12 @@ static void mxt_proc_t6_messages(struct mxt_data *data, u8 *msg)
 	u8 status = msg[1];
 	u32 crc = msg[2] | (msg[3] << 8) | (msg[4] << 16);
 
-	complete(&data->crc_completion);
-
 	if (crc != data->config_crc) {
 		data->config_crc = crc;
 		dev_dbg(dev, "T6 Config Checksum: 0x%06X\n", crc);
 	}
+
+	complete(&data->crc_completion);
 
 	/* Detect reset */
 	if (status & MXT_T6_STATUS_RESET)
@@ -1170,7 +1170,7 @@ static int mxt_proc_message(struct mxt_data *data, u8 *message)
 		mxt_proc_t48_messages(data, message);
 	} else if (!data->input_dev || data->suspended) {
 		/*
-		 * do not report events if input device is not
+		 * Do not report events if input device is not
 		 * yet registered or returning from suspend
 		 */
 		mxt_dump_message(data, message);
@@ -1250,7 +1250,12 @@ static irqreturn_t mxt_process_messages_t44(struct mxt_data *data)
 	count = data->msg_buf[0];
 
 	if (count == 0) {
-		dev_warn(dev, "Interrupt triggered but zero messages\n");
+		/*
+		 * This condition is caused by the CHG line being configured
+		 * in Mode 0. It results in unnecessary I2C operations but it
+		 * is benign.
+		 */
+		dev_dbg(dev, "Interrupt triggered but zero messages\n");
 		return IRQ_NONE;
 	} else if (count > data->max_reportid) {
 		dev_err(dev, "T44 count %d exceeded max report id\n", count);
@@ -1504,133 +1509,21 @@ static int mxt_check_retrigen(struct mxt_data *data)
 	return 0;
 }
 
-static int mxt_init_t7_power_cfg(struct mxt_data *data);
-
-/*
- * mxt_update_cfg - download configuration to chip
- *
- * Atmel Raw Config File Format
- *
- * The first four lines of the raw config file contain:
- *  1) Version
- *  2) Chip ID Information (first 7 bytes of device memory)
- *  3) Chip Information Block 24-bit CRC Checksum
- *  4) Chip Configuration 24-bit CRC Checksum
- *
- * The rest of the file consists of one line per object instance:
- *   <TYPE> <INSTANCE> <SIZE> <CONTENTS>
- *
- *   <TYPE> - 2-byte object type as hex
- *   <INSTANCE> - 2-byte object instance number as hex
- *   <SIZE> - 2-byte object size as hex
- *   <CONTENTS> - array of <SIZE> 1-byte hex values
- */
-static int mxt_update_cfg(struct mxt_data *data, const struct firmware *cfg)
+static int mxt_prepare_cfg_mem(struct mxt_data *data,
+			       const struct firmware *cfg,
+			       unsigned int data_pos,
+			       unsigned int cfg_start_ofs,
+			       u8 *config_mem,
+			       size_t config_mem_size)
 {
 	struct device *dev = &data->client->dev;
-	struct mxt_info cfg_info;
 	struct mxt_object *object;
-	int ret;
+	unsigned int type, instance, size, byte_offset;
 	int offset;
-	int data_pos;
-	int byte_offset;
+	int ret;
 	int i;
-	int cfg_start_ofs;
-	u32 info_crc, config_crc, calculated_crc;
-	u8 *config_mem;
-	size_t config_mem_size;
-	unsigned int type, instance, size;
-	u8 val;
 	u16 reg;
-
-	mxt_update_crc(data, MXT_COMMAND_REPORTALL, 1);
-
-	if (strncmp(cfg->data, MXT_CFG_MAGIC, strlen(MXT_CFG_MAGIC))) {
-		dev_err(dev, "Unrecognised config file\n");
-		ret = -EINVAL;
-		goto release;
-	}
-
-	data_pos = strlen(MXT_CFG_MAGIC);
-
-	/* Load information block and check */
-	for (i = 0; i < sizeof(struct mxt_info); i++) {
-		ret = sscanf(cfg->data + data_pos, "%hhx%n",
-			     (unsigned char *)&cfg_info + i,
-			     &offset);
-		if (ret != 1) {
-			dev_err(dev, "Bad format\n");
-			ret = -EINVAL;
-			goto release;
-		}
-
-		data_pos += offset;
-	}
-
-	if (cfg_info.family_id != data->info->family_id) {
-		dev_err(dev, "Family ID mismatch!\n");
-		ret = -EINVAL;
-		goto release;
-	}
-
-	if (cfg_info.variant_id != data->info->variant_id) {
-		dev_err(dev, "Variant ID mismatch!\n");
-		ret = -EINVAL;
-		goto release;
-	}
-
-	/* Read CRCs */
-	ret = sscanf(cfg->data + data_pos, "%x%n", &info_crc, &offset);
-	if (ret != 1) {
-		dev_err(dev, "Bad format: failed to parse Info CRC\n");
-		ret = -EINVAL;
-		goto release;
-	}
-	data_pos += offset;
-
-	ret = sscanf(cfg->data + data_pos, "%x%n", &config_crc, &offset);
-	if (ret != 1) {
-		dev_err(dev, "Bad format: failed to parse Config CRC\n");
-		ret = -EINVAL;
-		goto release;
-	}
-	data_pos += offset;
-
-	/*
-	 * The Info Block CRC is calculated over mxt_info and the object
-	 * table. If it does not match then we are trying to load the
-	 * configuration from a different chip or firmware version, so
-	 * the configuration CRC is invalid anyway.
-	 */
-	if (info_crc == data->info_crc) {
-		if (config_crc == 0 || data->config_crc == 0) {
-			dev_info(dev, "CRC zero, attempting to apply config\n");
-		} else if (config_crc == data->config_crc) {
-			dev_dbg(dev, "Config CRC 0x%06X: OK\n",
-				 data->config_crc);
-			ret = 0;
-			goto release;
-		} else {
-			dev_info(dev, "Config CRC 0x%06X: does not match file 0x%06X\n",
-				 data->config_crc, config_crc);
-		}
-	} else {
-		dev_warn(dev,
-			 "Warning: Info CRC error - device=0x%06X file=0x%06X\n",
-			 data->info_crc, info_crc);
-	}
-
-	/* Malloc memory to store configuration */
-	cfg_start_ofs = MXT_OBJECT_START +
-			data->info->object_num * sizeof(struct mxt_object) +
-			MXT_INFO_CHECKSUM_SIZE;
-	config_mem_size = data->mem_size - cfg_start_ofs;
-	config_mem = kzalloc(config_mem_size, GFP_KERNEL);
-	if (!config_mem) {
-		dev_err(dev, "Failed to allocate memory\n");
-		ret = -ENOMEM;
-		goto release;
-	}
+	u8 val;
 
 	while (data_pos < cfg->size) {
 		/* Read type, instance, length */
@@ -1641,8 +1534,7 @@ static int mxt_update_cfg(struct mxt_data *data, const struct firmware *cfg)
 			break;
 		} else if (ret != 3) {
 			dev_err(dev, "Bad format: failed to parse object\n");
-			ret = -EINVAL;
-			goto release_mem;
+			return -EINVAL;
 		}
 		data_pos += offset;
 
@@ -1651,8 +1543,12 @@ static int mxt_update_cfg(struct mxt_data *data, const struct firmware *cfg)
 			/* Skip object */
 			for (i = 0; i < size; i++) {
 				ret = sscanf(cfg->data + data_pos, "%hhx%n",
-					     &val,
-					     &offset);
+					     &val, &offset);
+				if (ret != 1) {
+					dev_err(dev, "Bad format in T%d at %d\n",
+						type, i);
+					return -EINVAL;
+				}
 				data_pos += offset;
 			}
 			continue;
@@ -1682,8 +1578,7 @@ static int mxt_update_cfg(struct mxt_data *data, const struct firmware *cfg)
 
 		if (instance >= mxt_obj_instances(object)) {
 			dev_err(dev, "Object instances exceeded!\n");
-			ret = -EINVAL;
-			goto release_mem;
+			return -EINVAL;
 		}
 
 		reg = object->start_address + mxt_obj_size(object) * instance;
@@ -1693,9 +1588,9 @@ static int mxt_update_cfg(struct mxt_data *data, const struct firmware *cfg)
 				     &val,
 				     &offset);
 			if (ret != 1) {
-				dev_err(dev, "Bad format in T%d\n", type);
-				ret = -EINVAL;
-				goto release_mem;
+				dev_err(dev, "Bad format in T%d at %d\n",
+					type, i);
+				return -EINVAL;
 			}
 			data_pos += offset;
 
@@ -1704,17 +1599,166 @@ static int mxt_update_cfg(struct mxt_data *data, const struct firmware *cfg)
 
 			byte_offset = reg + i - cfg_start_ofs;
 
-			if ((byte_offset >= 0)
-			    && (byte_offset <= config_mem_size)) {
+			if (byte_offset >= 0 && byte_offset < config_mem_size) {
 				*(config_mem + byte_offset) = val;
 			} else {
 				dev_err(dev, "Bad object: reg:%d, T%d, ofs=%d\n",
 					reg, object->type, byte_offset);
-				ret = -EINVAL;
-				goto release_mem;
+				return -EINVAL;
 			}
 		}
 	}
+
+	return 0;
+}
+
+static int mxt_upload_cfg_mem(struct mxt_data *data, unsigned int cfg_start,
+			      u8 *config_mem, size_t config_mem_size)
+{
+	unsigned int byte_offset = 0;
+	int error;
+
+	/* Write configuration as blocks */
+	while (byte_offset < config_mem_size) {
+		unsigned int size = config_mem_size - byte_offset;
+
+		if (size > MXT_MAX_BLOCK_WRITE)
+			size = MXT_MAX_BLOCK_WRITE;
+
+		error = __mxt_write_reg(data->client,
+					cfg_start + byte_offset,
+					size, config_mem + byte_offset);
+		if (error) {
+			dev_err(&data->client->dev,
+				"Config write error, ret=%d\n", error);
+			return error;
+		}
+
+		byte_offset += size;
+	}
+
+	return 0;
+}
+
+static int mxt_init_t7_power_cfg(struct mxt_data *data);
+
+/*
+ * mxt_update_cfg - download configuration to chip
+ *
+ * Atmel Raw Config File Format
+ *
+ * The first four lines of the raw config file contain:
+ *  1) Version
+ *  2) Chip ID Information (first 7 bytes of device memory)
+ *  3) Chip Information Block 24-bit CRC Checksum
+ *  4) Chip Configuration 24-bit CRC Checksum
+ *
+ * The rest of the file consists of one line per object instance:
+ *   <TYPE> <INSTANCE> <SIZE> <CONTENTS>
+ *
+ *   <TYPE> - 2-byte object type as hex
+ *   <INSTANCE> - 2-byte object instance number as hex
+ *   <SIZE> - 2-byte object size as hex
+ *   <CONTENTS> - array of <SIZE> 1-byte hex values
+ */
+static int mxt_update_cfg(struct mxt_data *data, const struct firmware *cfg)
+{
+	struct device *dev = &data->client->dev;
+	struct mxt_info cfg_info;
+	int ret;
+	int offset;
+	int data_pos;
+	int i;
+	int cfg_start_ofs;
+	u32 info_crc, config_crc, calculated_crc;
+	u8 *config_mem;
+	size_t config_mem_size;
+
+	mxt_update_crc(data, MXT_COMMAND_REPORTALL, 1);
+
+	if (strncmp(cfg->data, MXT_CFG_MAGIC, strlen(MXT_CFG_MAGIC))) {
+		dev_err(dev, "Unrecognised config file\n");
+		return -EINVAL;
+	}
+
+	data_pos = strlen(MXT_CFG_MAGIC);
+
+	/* Load information block and check */
+	for (i = 0; i < sizeof(struct mxt_info); i++) {
+		ret = sscanf(cfg->data + data_pos, "%hhx%n",
+			     (unsigned char *)&cfg_info + i,
+			     &offset);
+		if (ret != 1) {
+			dev_err(dev, "Bad format\n");
+			return -EINVAL;
+		}
+
+		data_pos += offset;
+	}
+
+	if (cfg_info.family_id != data->info->family_id) {
+		dev_err(dev, "Family ID mismatch!\n");
+		return -EINVAL;
+	}
+
+	if (cfg_info.variant_id != data->info->variant_id) {
+		dev_err(dev, "Variant ID mismatch!\n");
+		return -EINVAL;
+	}
+
+	/* Read CRCs */
+	ret = sscanf(cfg->data + data_pos, "%x%n", &info_crc, &offset);
+	if (ret != 1) {
+		dev_err(dev, "Bad format: failed to parse Info CRC\n");
+		return -EINVAL;
+	}
+	data_pos += offset;
+
+	ret = sscanf(cfg->data + data_pos, "%x%n", &config_crc, &offset);
+	if (ret != 1) {
+		dev_err(dev, "Bad format: failed to parse Config CRC\n");
+		return -EINVAL;
+	}
+	data_pos += offset;
+
+	/*
+	 * The Info Block CRC is calculated over mxt_info and the object
+	 * table. If it does not match then we are trying to load the
+	 * configuration from a different chip or firmware version, so
+	 * the configuration CRC is invalid anyway.
+	 */
+	if (info_crc == data->info_crc) {
+		if (config_crc == 0 || data->config_crc == 0) {
+			dev_info(dev, "CRC zero, attempting to apply config\n");
+		} else if (config_crc == data->config_crc) {
+			dev_dbg(dev, "Config CRC 0x%06X: OK\n",
+				 data->config_crc);
+			return 0;
+		} else {
+			dev_info(dev, "Config CRC 0x%06X: does not match file 0x%06X\n",
+				 data->config_crc, config_crc);
+		}
+	} else {
+		dev_warn(dev,
+			 "Warning: Info CRC error - device=0x%06X file=0x%06X\n",
+			 data->info_crc, info_crc);
+	}
+
+	/* Malloc memory to store configuration */
+	cfg_start_ofs = MXT_OBJECT_START +
+			data->info->object_num * sizeof(struct mxt_object) +
+			MXT_INFO_CHECKSUM_SIZE;
+	config_mem_size = data->mem_size - cfg_start_ofs;
+	config_mem = kzalloc(config_mem_size, GFP_KERNEL);
+	if (!config_mem) {
+		dev_err(dev, "Failed to allocate memory\n");
+		return -ENOMEM;
+	}
+
+	ret = mxt_prepare_cfg_mem(data, cfg, data_pos, cfg_start_ofs,
+				  config_mem, config_mem_size);
+	if (ret)
+		goto release_mem;
 
 	/* Calculate crc of the received configs (not the raw config file) */
 	if (data->T7_address < cfg_start_ofs) {
@@ -1728,28 +1772,14 @@ static int mxt_update_cfg(struct mxt_data *data, const struct firmware *cfg)
 					   data->T7_address - cfg_start_ofs,
 					   config_mem_size);
 
-	if (config_crc > 0 && (config_crc != calculated_crc))
+	if (config_crc > 0 && config_crc != calculated_crc)
 		dev_warn(dev, "Config CRC error, calculated=%06X, file=%06X\n",
 			 calculated_crc, config_crc);
 
-	/* Write configuration as blocks */
-	byte_offset = 0;
-	while (byte_offset < config_mem_size) {
-		size = config_mem_size - byte_offset;
-
-		if (size > MXT_MAX_BLOCK_WRITE)
-			size = MXT_MAX_BLOCK_WRITE;
-
-		ret = __mxt_write_reg(data->client,
-				      cfg_start_ofs + byte_offset,
-				      size, config_mem + byte_offset);
-		if (ret != 0) {
-			dev_err(dev, "Config write error, ret=%d\n", ret);
-			goto release_mem;
-		}
-
-		byte_offset += size;
-	}
+	ret = mxt_upload_cfg_mem(data, cfg_start_ofs,
+				 config_mem, config_mem_size);
+	if (ret)
+		goto release_mem;
 
 	mxt_update_crc(data, MXT_COMMAND_BACKUPNV, MXT_BACKUP_VALUE);
 
@@ -1768,63 +1798,7 @@ static int mxt_update_cfg(struct mxt_data *data, const struct firmware *cfg)
 
 release_mem:
 	kfree(config_mem);
-release:
-	release_firmware(cfg);
 	return ret;
-}
-
-static int mxt_set_t7_power_cfg(struct mxt_data *data, u8 sleep)
-{
-	struct device *dev = &data->client->dev;
-	int error;
-	struct t7_config *new_config;
-	struct t7_config deepsleep = { .active = 0, .idle = 0 };
-
-	if (sleep == MXT_POWER_CFG_DEEPSLEEP)
-		new_config = &deepsleep;
-	else
-		new_config = &data->t7_cfg;
-
-	error = __mxt_write_reg(data->client, data->T7_address,
-				sizeof(data->t7_cfg), new_config);
-	if (error)
-		return error;
-
-	dev_dbg(dev, "Set T7 ACTV:%d IDLE:%d\n",
-		new_config->active, new_config->idle);
-
-	return 0;
-}
-
-static int mxt_init_t7_power_cfg(struct mxt_data *data)
-{
-	struct device *dev = &data->client->dev;
-	int error;
-	bool retry = false;
-
-recheck:
-	error = __mxt_read_reg(data->client, data->T7_address,
-				sizeof(data->t7_cfg), &data->t7_cfg);
-	if (error)
-		return error;
-
-	if (data->t7_cfg.active == 0 || data->t7_cfg.idle == 0) {
-		if (!retry) {
-			dev_dbg(dev, "T7 cfg zero, resetting\n");
-			mxt_soft_reset(data);
-			retry = true;
-			goto recheck;
-		} else {
-			dev_dbg(dev, "T7 cfg zero after reset, overriding\n");
-			data->t7_cfg.active = 20;
-			data->t7_cfg.idle = 100;
-			return mxt_set_t7_power_cfg(data, MXT_POWER_CFG_RUN);
-		}
-	}
-
-	dev_dbg(dev, "Initialized power cfg: ACTV %d, IDLE %d\n",
-		data->t7_cfg.active, data->t7_cfg.idle);
-	return 0;
 }
 
 static int mxt_acquire_irq(struct mxt_data *data)
@@ -1853,7 +1827,6 @@ static void mxt_free_input_device(struct mxt_data *data)
 static void mxt_free_object_table(struct mxt_data *data)
 {
 	mxt_debug_msg_remove(data);
-	mxt_free_input_device(data);
 
 	data->object_table = NULL;
 	data->info = NULL;
@@ -1918,10 +1891,12 @@ static int mxt_parse_object_table(struct mxt_data *data,
 
 		switch (object->type) {
 		case MXT_GEN_MESSAGE_T5:
-			if (data->info->family_id == 0x80) {
+			if (data->info->family_id == 0x80 &&
+			    data->info->version < 0x20) {
 				/*
-				 * On mXT224 read and discard unused CRC byte
-				 * otherwise DMA reads are misaligned
+				 * On mXT224 firmware versions prior to V2.0
+				 * read and discard unused CRC byte otherwise
+				 * DMA reads are misaligned.
 				 */
 				data->T5_msg_size = mxt_obj_size(object);
 			} else {
@@ -1929,6 +1904,7 @@ static int mxt_parse_object_table(struct mxt_data *data,
 				data->T5_msg_size = mxt_obj_size(object) - 1;
 			}
 			data->T5_address = object->start_address;
+			break;
 		case MXT_GEN_COMMAND_T6:
 			data->T6_reportid = min_id;
 			data->T6_address = object->start_address;
@@ -2253,6 +2229,7 @@ static int mxt_initialize_t9_input_device(struct mxt_data *data)
 	input_dev->close = mxt_input_close;
 
 	__set_bit(EV_ABS, input_dev->evbit);
+	__set_bit(INPUT_PROP_DIRECT, input_dev->propbit);
 	input_set_capability(input_dev, EV_KEY, BTN_TOUCH);
 
 	if (pdata->t19_num_keys) {
@@ -2516,46 +2493,45 @@ static int mxt_configure_objects(struct mxt_data *data,
 static void mxt_config_cb(const struct firmware *cfg, void *ctx)
 {
 	mxt_configure_objects(ctx, cfg);
+	release_firmware(cfg);
 }
 
 static int mxt_initialize(struct mxt_data *data)
 {
 	struct i2c_client *client = data->client;
+	int recovery_attempts = 0;
 	int error;
-	bool alt_bootloader_addr = false;
-	bool retry = false;
 
-retry_info:
-	error = mxt_read_info_block(data);
-	if (error) {
-retry_bootloader:
-		error = mxt_probe_bootloader(data, alt_bootloader_addr);
+	while (1) {
+		error = mxt_read_info_block(data);
+		if (!error)
+			break;
+
+		/* Check bootloader state */
+		error = mxt_probe_bootloader(data, false);
 		if (error) {
-			if (alt_bootloader_addr) {
+			dev_info(&client->dev, "Trying alternate bootloader address\n");
+			error = mxt_probe_bootloader(data, true);
+			if (error) {
 				/* Chip is not in appmode or bootloader mode */
 				return error;
 			}
-
-			dev_info(&client->dev, "Trying alternate bootloader address\n");
-			alt_bootloader_addr = true;
-			goto retry_bootloader;
-		} else {
-			if (retry) {
-				dev_err(&client->dev, "Could not recover from bootloader mode\n");
-				/*
-				 * We can reflash from this state, so do not
-				 * abort init
-				 */
-				data->in_bootloader = true;
-				return 0;
-			}
-
-			/* Attempt to exit bootloader into app mode */
-			mxt_send_bootloader_cmd(data, false);
-			msleep(MXT_FW_RESET_TIME);
-			retry = true;
-			goto retry_info;
 		}
+
+		/* OK, we are in bootloader, see if we can recover */
+		if (++recovery_attempts > 1) {
+			dev_err(&client->dev, "Could not recover from bootloader mode\n");
+			/*
+			 * We can reflash from this state, so do not
+			 * abort initialization.
+			 */
+			data->in_bootloader = true;
+			return 0;
+		}
+
+		/* Attempt to exit bootloader into app mode */
+		mxt_send_bootloader_cmd(data, false);
+		msleep(MXT_FW_RESET_TIME);
 	}
 
 	error = mxt_check_retrigen(data);
@@ -2571,9 +2547,14 @@ retry_bootloader:
 		goto err_free_object_table;
 
 	if (data->cfg_name) {
-		request_firmware_nowait(THIS_MODULE, true, data->cfg_name,
-					&data->client->dev, GFP_KERNEL, data,
-					mxt_config_cb);
+		error = request_firmware_nowait(THIS_MODULE, true,
+					data->cfg_name, &data->client->dev,
+					GFP_KERNEL, data, mxt_config_cb);
+		if (error) {
+			dev_err(&client->dev, "Failed to invoke firmware loader: %d\n",
+				error);
+			goto err_free_object_table;
+		}
 	} else {
 		error = mxt_configure_objects(data, NULL);
 		if (error)
@@ -2585,6 +2566,60 @@ retry_bootloader:
 err_free_object_table:
 	mxt_free_object_table(data);
 	return error;
+}
+
+static int mxt_set_t7_power_cfg(struct mxt_data *data, u8 sleep)
+{
+	struct device *dev = &data->client->dev;
+	int error;
+	struct t7_config *new_config;
+	struct t7_config deepsleep = { .active = 0, .idle = 0 };
+
+	if (sleep == MXT_POWER_CFG_DEEPSLEEP)
+		new_config = &deepsleep;
+	else
+		new_config = &data->t7_cfg;
+
+	error = __mxt_write_reg(data->client, data->T7_address,
+				sizeof(data->t7_cfg), new_config);
+	if (error)
+		return error;
+
+	dev_dbg(dev, "Set T7 ACTV:%d IDLE:%d\n",
+		new_config->active, new_config->idle);
+
+	return 0;
+}
+
+static int mxt_init_t7_power_cfg(struct mxt_data *data)
+{
+	struct device *dev = &data->client->dev;
+	int error;
+	bool retry = false;
+
+recheck:
+	error = __mxt_read_reg(data->client, data->T7_address,
+				sizeof(data->t7_cfg), &data->t7_cfg);
+	if (error)
+		return error;
+
+	if (data->t7_cfg.active == 0 || data->t7_cfg.idle == 0) {
+		if (!retry) {
+			dev_dbg(dev, "T7 cfg zero, resetting\n");
+			mxt_soft_reset(data);
+			retry = true;
+			goto recheck;
+		} else {
+			dev_dbg(dev, "T7 cfg zero after reset, overriding\n");
+			data->t7_cfg.active = 20;
+			data->t7_cfg.idle = 100;
+			return mxt_set_t7_power_cfg(data, MXT_POWER_CFG_RUN);
+		}
+	}
+
+	dev_dbg(dev, "Initialized power cfg: ACTV %d, IDLE %d\n",
+		data->t7_cfg.active, data->t7_cfg.idle);
+	return 0;
 }
 
 static int mxt_configure_objects(struct mxt_data *data,
@@ -2629,6 +2664,7 @@ static ssize_t mxt_config_csum_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
 	struct mxt_data *data = dev_get_drvdata(dev);
+
 	return scnprintf(buf, PAGE_SIZE, "%06x\n", data->config_crc);
 }
 
@@ -2637,6 +2673,10 @@ static ssize_t mxt_fw_version_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
 	struct mxt_data *data = dev_get_drvdata(dev);
+
+	if (!data->object_table)
+		return -EINVAL;
+
 	return scnprintf(buf, PAGE_SIZE, "%u.%u.%02X\n",
 			 data->info->version >> 4, data->info->version & 0xf,
 			 data->info->build);
@@ -2647,6 +2687,10 @@ static ssize_t mxt_hw_version_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
 	struct mxt_data *data = dev_get_drvdata(dev);
+
+	if (!data->object_table)
+		return -EINVAL;
+
 	return scnprintf(buf, PAGE_SIZE, "%u.%u\n",
 			data->info->family_id, data->info->variant_id);
 }
@@ -2678,6 +2722,9 @@ static ssize_t mxt_object_show(struct device *dev,
 	int i, j;
 	int error;
 	u8 *obuf;
+
+	if (!data->object_table)
+		return -EINVAL;
 
 	/* Pre-allocate buffer large enough to hold max sized object. */
 	obuf = kmalloc(256, GFP_KERNEL);
@@ -2779,11 +2826,13 @@ static int mxt_load_fw(struct device *dev)
 		ret = mxt_lookup_bootloader_address(data, 0);
 		if (ret)
 			goto release_firmware;
+
+		mxt_free_input_device(data);
+		mxt_free_object_table(data);
 	} else {
 		enable_irq(data->irq);
 	}
 
-	mxt_free_object_table(data);
 	INIT_COMPLETION(data->bl_completion);
 
 	ret = mxt_check_bootloader(data, MXT_WAITING_BOOTLOAD_CMD, false);
@@ -2962,9 +3011,12 @@ static ssize_t mxt_update_cfg_store(struct device *dev,
 
 	ret = mxt_configure_objects(data, cfg);
 	if (ret)
-		goto out;
+		goto release;
 
 	ret = count;
+
+release:
+	release_firmware(cfg);
 out:
 	data->updating_config = false;
 	return ret;
@@ -2990,36 +3042,42 @@ static ssize_t mxt_debug_v2_enable_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct mxt_data *data = dev_get_drvdata(dev);
-	int i;
+	u8 i;
+	ssize_t ret;
 
-	if (sscanf(buf, "%u", &i) == 1 && i < 2) {
+	if (kstrtou8(buf, 0, &i) == 0 && i < 2) {
 		if (i == 1)
 			mxt_debug_msg_enable(data);
 		else
 			mxt_debug_msg_disable(data);
 
-		return count;
+		ret = count;
 	} else {
 		dev_dbg(dev, "debug_enabled write error\n");
-		return -EINVAL;
+		ret = -EINVAL;
 	}
+
+	return ret;
 }
 
 static ssize_t mxt_debug_enable_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct mxt_data *data = dev_get_drvdata(dev);
-	int i;
+	u8 i;
+	ssize_t ret;
 
-	if (sscanf(buf, "%u", &i) == 1 && i < 2) {
+	if (kstrtou8(buf, 0, &i) == 0 && i < 2) {
 		data->debug_enabled = (i == 1);
 
 		dev_dbg(dev, "%s\n", i ? "debug enabled" : "debug disabled");
-		return count;
+		ret = count;
 	} else {
 		dev_dbg(dev, "debug_enabled write error\n");
-		return -EINVAL;
+		ret = -EINVAL;
 	}
+
+	return ret;
 }
 
 static int mxt_check_mem_access_params(struct mxt_data *data, loff_t off,
@@ -3077,12 +3135,12 @@ static DEVICE_ATTR(hw_version, S_IRUGO, mxt_hw_version_show, NULL);
 static DEVICE_ATTR(object, S_IRUGO, mxt_object_show, NULL);
 static DEVICE_ATTR(update_fw, S_IWUSR, NULL, mxt_update_fw_store);
 static DEVICE_ATTR(update_cfg, S_IWUSR, NULL, mxt_update_cfg_store);
+static DEVICE_ATTR(config_csum, S_IRUGO, mxt_config_csum_show, NULL);
+static DEVICE_ATTR(debug_enable, S_IWUSR | S_IRUSR, mxt_debug_enable_show,
+		   mxt_debug_enable_store);
 static DEVICE_ATTR(debug_v2_enable, S_IWUSR | S_IRUSR, NULL,
 		   mxt_debug_v2_enable_store);
 static DEVICE_ATTR(debug_notify, S_IRUGO, mxt_debug_notify_show, NULL);
-static DEVICE_ATTR(debug_enable, S_IWUSR | S_IRUSR, mxt_debug_enable_show,
-		   mxt_debug_enable_store);
-static DEVICE_ATTR(config_csum, S_IRUGO, mxt_config_csum_show, NULL);
 
 static struct attribute *mxt_attrs[] = {
 	&dev_attr_fw_version.attr,
@@ -3090,10 +3148,10 @@ static struct attribute *mxt_attrs[] = {
 	&dev_attr_object.attr,
 	&dev_attr_update_fw.attr,
 	&dev_attr_update_cfg.attr,
+	&dev_attr_config_csum.attr,
 	&dev_attr_debug_enable.attr,
 	&dev_attr_debug_v2_enable.attr,
 	&dev_attr_debug_notify.attr,
-	&dev_attr_config_csum.attr,
 	NULL
 };
 
@@ -3191,55 +3249,78 @@ static void mxt_input_close(struct input_dev *dev)
 static struct mxt_platform_data *mxt_parse_dt(struct i2c_client *client)
 {
 	struct mxt_platform_data *pdata;
-	struct device *dev = &client->dev;
-	struct property *prop;
-	unsigned int *keymap;
+	u32 *keymap;
 	int proplen, ret;
 
-	pdata = devm_kzalloc(dev, sizeof(*pdata), GFP_KERNEL);
+	if (!client->dev.of_node)
+		return ERR_PTR(-ENODEV);
+
+	pdata = devm_kzalloc(&client->dev, sizeof(*pdata), GFP_KERNEL);
 	if (!pdata)
-		return NULL;
+		return ERR_PTR(-ENOMEM);
 
 	/* reset gpio */
-	pdata->gpio_reset = of_get_named_gpio_flags(dev->of_node,
+	pdata->gpio_reset = of_get_named_gpio_flags(client->dev.of_node,
 		"atmel,reset-gpio", 0, NULL);
 
-	of_property_read_string(dev->of_node, "atmel,cfg_name",
+	of_property_read_string(client->dev.of_node, "atmel,cfg_name",
 				&pdata->cfg_name);
 
-	of_property_read_string(dev->of_node, "atmel,input_name",
+	of_property_read_string(client->dev.of_node, "atmel,input_name",
 				&pdata->input_name);
 
-	prop = of_find_property(dev->of_node, "linux,gpio-keymap", &proplen);
-	if (prop) {
+	if (of_find_property(client->dev.of_node, "linux,gpio-keymap",
+			     &proplen)) {
 		pdata->t19_num_keys = proplen / sizeof(u32);
 
-		keymap = devm_kzalloc(dev,
-			pdata->t19_num_keys * sizeof(u32), GFP_KERNEL);
+		keymap = devm_kzalloc(&client->dev,
+				pdata->t19_num_keys * sizeof(keymap[0]),
+				GFP_KERNEL);
 		if (!keymap)
-			return NULL;
-
-		pdata->t19_keymap = keymap;
+			return ERR_PTR(-ENOMEM);
 
 		ret = of_property_read_u32_array(client->dev.of_node,
 			"linux,gpio-keymap", keymap, pdata->t19_num_keys);
 		if (ret) {
-			dev_err(dev,
+			dev_err(&client->dev,
 				"Unable to read device tree key codes: %d\n",
 				 ret);
 			return NULL;
 		}
+
+		pdata->t19_keymap = keymap;
 	}
+
+	return pdata;
+}
+#else
+static struct mxt_platform_data *mxt_parse_dt(struct i2c_client *client)
+{
+	struct mxt_platform_data *pdata;
+
+	pdata = devm_kzalloc(&client->dev, sizeof(*pdata), GFP_KERNEL);
+	if (!pdata)
+		return ERR_PTR(-ENOMEM);
+
+	/* Set default parameters */
+	pdata->irqflags = IRQF_TRIGGER_FALLING;
 
 	return pdata;
 }
 #endif
 
-static int mxt_probe(struct i2c_client *client,
-		const struct i2c_device_id *id)
+static int mxt_probe(struct i2c_client *client, const struct i2c_device_id *id)
 {
 	struct mxt_data *data;
+	const struct mxt_platform_data *pdata;
 	int error;
+
+	pdata = dev_get_platdata(&client->dev);
+	if (!pdata) {
+		pdata = mxt_parse_dt(client);
+		if (IS_ERR(pdata))
+			return PTR_ERR(pdata);
+	}
 
 	data = kzalloc(sizeof(struct mxt_data), GFP_KERNEL);
 	if (!data) {
@@ -3251,27 +3332,9 @@ static int mxt_probe(struct i2c_client *client,
 		 client->adapter->nr, client->addr);
 
 	data->client = client;
+	data->pdata = pdata;
 	data->irq = client->irq;
-	data->pdata = dev_get_platdata(&client->dev);
 	i2c_set_clientdata(client, data);
-
-#ifdef CONFIG_OF
-	if (!data->pdata && client->dev.of_node)
-		data->pdata = mxt_parse_dt(client);
-#endif
-
-	if (!data->pdata) {
-		data->pdata = devm_kzalloc(&client->dev, sizeof(*data->pdata),
-					   GFP_KERNEL);
-		if (!data->pdata) {
-			dev_err(&client->dev, "Failed to allocate pdata\n");
-			error = -ENOMEM;
-			goto err_free_mem;
-		}
-
-		/* Set default parameters */
-		data->pdata->irqflags = IRQF_TRIGGER_FALLING;
-	}
 
 	if (data->pdata->cfg_name)
 		mxt_update_file_name(&data->client->dev,
@@ -3285,7 +3348,7 @@ static int mxt_probe(struct i2c_client *client,
 	mutex_init(&data->debug_msg_lock);
 
 	error = request_threaded_irq(client->irq, NULL, mxt_interrupt,
-				     data->pdata->irqflags | IRQF_ONESHOT,
+				     pdata->irqflags | IRQF_ONESHOT,
 				     client->name, data);
 	if (error) {
 		dev_err(&client->dev, "Failed to register interrupt\n");
@@ -3296,15 +3359,11 @@ static int mxt_probe(struct i2c_client *client,
 
 	disable_irq(data->irq);
 
-	error = mxt_initialize(data);
-	if (error)
-		goto err_free_irq;
-
 	error = sysfs_create_group(&client->dev.kobj, &mxt_attr_group);
 	if (error) {
 		dev_err(&client->dev, "Failure %d creating sysfs group\n",
 			error);
-		goto err_free_object;
+		goto err_free_irq;
 	}
 
 	sysfs_bin_attr_init(&data->mem_access_attr);
@@ -3336,12 +3395,17 @@ static int mxt_probe(struct i2c_client *client,
 	register_early_suspend(&data->early_suspend);
 #endif
 
+	error = mxt_initialize(data);
+	if (error)
+		goto err_remove_mem_access;
+
 	return 0;
 
+err_remove_mem_access:
+	sysfs_remove_bin_file(&client->dev.kobj, &data->mem_access_attr);
+	data->mem_access_attr.attr.name = NULL;
 err_remove_sysfs_group:
 	sysfs_remove_group(&client->dev.kobj, &mxt_attr_group);
-err_free_object:
-	mxt_free_object_table(data);
 err_free_irq:
 	free_irq(client->irq, data);
 err_free_mem:
@@ -3368,6 +3432,7 @@ static int mxt_remove(struct i2c_client *client)
 	free_irq(data->irq, data);
 	regulator_put(data->reg_avdd);
 	regulator_put(data->reg_vdd);
+	mxt_free_input_device(data);
 	mxt_free_object_table(data);
 	kfree(data);
 
@@ -3377,21 +3442,14 @@ static int mxt_remove(struct i2c_client *client)
 #ifdef CONFIG_PM_SLEEP
 static int mxt_suspend(struct device *dev)
 {
-	int error;
 	struct i2c_client *client = to_i2c_client(dev);
 	struct mxt_data *data = i2c_get_clientdata(client);
 	struct input_dev *input_dev = data->input_dev;
 
 	mutex_lock(&input_dev->mutex);
 
-	if (input_dev->users) {
-		error = mxt_stop(data);
-		if (error < 0) {
-			dev_err(dev, "mxt_stop failed in suspend\n");
-			mutex_unlock(&input_dev->mutex);
-			return error;
-		}
-	}
+	if (input_dev->users)
+		mxt_stop(data);
 
 	mutex_unlock(&input_dev->mutex);
 
@@ -3400,21 +3458,14 @@ static int mxt_suspend(struct device *dev)
 
 static int mxt_resume(struct device *dev)
 {
-	int error;
 	struct i2c_client *client = to_i2c_client(dev);
 	struct mxt_data *data = i2c_get_clientdata(client);
 	struct input_dev *input_dev = data->input_dev;
 
 	mutex_lock(&input_dev->mutex);
 
-	if (input_dev->users) {
-		error = mxt_start(data);
-		if (error < 0) {
-			dev_err(dev, "mxt_start failed in resume\n");
-			mutex_unlock(&input_dev->mutex);
-			return error;
-		}
-	}
+	if (input_dev->users)
+		mxt_start(data);
 
 	mutex_unlock(&input_dev->mutex);
 
