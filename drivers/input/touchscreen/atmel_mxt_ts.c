@@ -978,6 +978,8 @@ static void mxt_proc_t100_message(struct mxt_data *data, u8 *message)
 	u8 orientation = 0;
 	bool touch_active = false;
 	bool eraser, barrel;
+	static bool update_butt0;
+	static bool update_butt1;
 
 	id = message[0] - data->T100_reportid_min - 2;
 
@@ -1063,8 +1065,14 @@ static void mxt_proc_t100_message(struct mxt_data *data, u8 *message)
 		input_report_abs(input_dev, ABS_MT_PRESSURE, pressure);
 		input_report_abs(input_dev, ABS_MT_ORIENTATION, orientation);
 
-		input_report_key(input_dev, BTN_STYLUS, (message[6] & 0x4));
-		input_report_key(input_dev, BTN_STYLUS2, (message[6] & 0x8));
+		if (update_butt0 != eraser) {
+			input_report_key(input_dev, BTN_STYLUS, (message[6] & 0x4));
+			update_butt0 = eraser;
+		}
+		if (update_butt1 != barrel) {
+			input_report_key(input_dev, BTN_STYLUS2, (message[6] & 0x8));
+			update_butt1 = barrel;
+		}
 	} else {
 		dev_dbg(dev,
 			"[%u] status:%02X\n", id, status);
