@@ -1356,7 +1356,7 @@ static irqreturn_t mxt_interrupt(int irq, void *dev_id)
 {
 	struct mxt_data *data = dev_id;
 
-	if (data->in_bootloader) {
+	if (data->in_bootloader || data->updating_config) {
 		/* bootloader state transition completion */
 		complete(&data->bl_completion);
 		return IRQ_HANDLED;
@@ -3399,6 +3399,25 @@ static int mxt_probe(struct i2c_client *client, const struct i2c_device_id *id)
 	if (error)
 		goto err_remove_mem_access;
 
+	/*
+	 * bootloader is up and running; apps mode can't be recoverred.
+	 * this might be caused by flashing firmware in previous and somehow fails
+	 * we try to recovery it by flashing firmware and then re-start mxt_initialize
+	 */
+	if (data->in_bootloader) {
+		data->fw_name = "maxtouch.fw";
+		error = mxt_load_fw(&data->client->dev);
+		if (error) {
+			dev_err(&data->client->dev, "The firmware update failed(%d)\n", error);
+			goto err_remove_mem_access;
+		} else {
+			dev_info(&data->client->dev, "The firmware update succeeded\n");
+			msleep(MXT_RESET_TIME);
+			error = mxt_initialize(data);
+			if (error)
+				goto err_remove_mem_access;
+		}
+	}
 	return 0;
 
 err_remove_mem_access:
