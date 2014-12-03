@@ -45,6 +45,16 @@
 #if (LINUX_VERSION_CODE > KERNEL_VERSION(3, 6, 8))
 #define KERNEL_3_6_8_ABOVE
 #endif
+
+#include <linux/async.h>
+/* Firmware */
+#define MXT_FW_NAME		"maxtouch.fw"
+#define MXT_FW_VER		0xAA
+
+/* Config file */
+#define MXT_CONFIG_NAME		"maxtouch.cfg"
+#define MXT_CONFIG_CRC		0x000000
+
 /* Configuration file */
 #define MXT_CFG_MAGIC		"OBP_RAW V1"
 
@@ -283,6 +293,7 @@ struct mxt_data {
 	struct regulator *reg_avdd;
 	char *fw_name;
 	char *cfg_name;
+	bool force_update;
 
 	/* Cached parameters from object table */
 	u16 T5_address;
@@ -2546,21 +2557,6 @@ static int mxt_initialize(struct mxt_data *data)
 	if (error)
 		goto err_free_object_table;
 
-	if (data->cfg_name) {
-		error = request_firmware_nowait(THIS_MODULE, true,
-					data->cfg_name, &data->client->dev,
-					GFP_KERNEL, data, mxt_config_cb);
-		if (error) {
-			dev_err(&client->dev, "Failed to invoke firmware loader: %d\n",
-				error);
-			goto err_free_object_table;
-		}
-	} else {
-		error = mxt_configure_objects(data, NULL);
-		if (error)
-			goto err_free_object_table;
-	}
-
 	return 0;
 
 err_free_object_table:
@@ -2782,6 +2778,30 @@ static int mxt_check_firmware_format(struct device *dev,
 	return -EINVAL;
 }
 
+static int mxt_load_cfg(struct device *dev)
+{
+	struct mxt_data *data = dev_get_drvdata(dev);
+	const struct firmware *cfg;
+	int error;
+
+	error = request_firmware(&cfg, data->cfg_name, dev);
+	if (error < 0) {
+		dev_err(dev, "Failure to request config file %s\n",
+			data->cfg_name);
+		error = -ENOENT;
+		goto out;
+	}
+
+	data->updating_config = true;
+
+	mxt_free_input_device(data);
+
+	error = mxt_configure_objects(data, cfg);
+
+out:
+	data->updating_config = false;
+	return error;
+}
 static int mxt_load_fw(struct device *dev)
 {
 	struct mxt_data *data = dev_get_drvdata(dev);
@@ -2960,6 +2980,7 @@ static ssize_t mxt_update_fw_store(struct device *dev,
 
 		data->suspended = false;
 
+		msleep(MXT_RESET_TIME);
 		error = mxt_initialize(data);
 		if (error)
 			return error;
@@ -3020,6 +3041,39 @@ release:
 out:
 	data->updating_config = false;
 	return ret;
+}
+
+static void mxt_force_updating(void *closure, async_cookie_t cookie)
+{
+	struct mxt_data *data = closure;
+	u8 info_build;
+	int error;
+
+	if (data->info != NULL)
+		info_build = data->info->build;
+
+	data->fw_name = MXT_FW_NAME;
+	data->cfg_name = MXT_CONFIG_NAME;
+
+	if (data->force_update || info_build < MXT_FW_VER)) {
+		error = mxt_load_fw(&data->client->dev);
+		if (error) {
+			dev_err(&data->client->dev, "The firmware update failed(%d)\n", error);
+		} else {
+			dev_info(&data->client->dev, "The firmware update succeeded\n");
+			msleep(MXT_RESET_TIME);
+			mxt_initialize(data);
+		}
+	}
+
+	disable_irq(data->irq);
+
+	error = mxt_load_cfg(&data->client->dev);
+	if (error) {
+		dev_err(&data->client->dev, "The config update failed(%d)\n", error);
+	}
+
+	enable_irq(data->irq);
 }
 
 static ssize_t mxt_debug_enable_show(struct device *dev,
@@ -3404,20 +3458,11 @@ static int mxt_probe(struct i2c_client *client, const struct i2c_device_id *id)
 	 * this might be caused by flashing firmware in previous and somehow fails
 	 * we try to recovery it by flashing firmware and then re-start mxt_initialize
 	 */
-	if (data->in_bootloader) {
-		data->fw_name = "maxtouch.fw";
-		error = mxt_load_fw(&data->client->dev);
-		if (error) {
-			dev_err(&data->client->dev, "The firmware update failed(%d)\n", error);
-			goto err_remove_mem_access;
-		} else {
-			dev_info(&data->client->dev, "The firmware update succeeded\n");
-			msleep(MXT_RESET_TIME);
-			error = mxt_initialize(data);
-			if (error)
-				goto err_remove_mem_access;
-		}
-	}
+	if (data->in_bootloader)
+		data->force_update = 1;
+
+	async_schedule(mxt_force_updating, data);
+
 	return 0;
 
 err_remove_mem_access:
