@@ -242,6 +242,8 @@ struct mxt_object {
 	u8 num_report_ids;
 } __packed;
 
+static struct workqueue_struct *maxtouch_wq;
+
 #if defined(CONFIG_FB)
 static int fb_notifier_callback(struct notifier_block *self,
 	unsigned long event, void *fdata);
@@ -291,9 +293,6 @@ struct mxt_data {
 	bool use_regulator;
 	struct regulator *reg_vdd;
 	struct regulator *reg_avdd;
-	char *fw_name;
-	char *cfg_name;
-	bool force_update;
 
 	/* Cached parameters from object table */
 	u16 T5_address;
@@ -336,6 +335,12 @@ struct mxt_data {
 
 	/* Indicates whether device is updating configuration */
 	bool updating_config;
+
+	/* for firmware and config file recovery and upgrade */
+	char *fw_name;
+	char *cfg_name;
+	struct work_struct work_upgrade;
+	bool force_upgrade;
 };
 
 static size_t mxt_obj_size(const struct mxt_object *obj)
@@ -3043,19 +3048,24 @@ out:
 	return ret;
 }
 
-static void mxt_force_updating(void *closure, async_cookie_t cookie)
+static void mxt_force_updating(struct work_struct *work)
 {
-	struct mxt_data *data = closure;
-	u8 info_build;
+	struct mxt_data *data =
+			container_of(work,
+				struct mxt_data, work_upgrade);
+	u8 fw_info;
 	int error;
 
 	if (data->info != NULL)
-		info_build = data->info->build;
+		fw_info = data->info->build;
+
+	if (data->in_bootloader)
+		data->force_upgrade = 1;
 
 	data->fw_name = MXT_FW_NAME;
 	data->cfg_name = MXT_CONFIG_NAME;
 
-	if (data->force_update || info_build < MXT_FW_VER)) {
+	if (data->force_upgrade || fw_info < MXT_FW_VER) {
 		error = mxt_load_fw(&data->client->dev);
 		if (error) {
 			dev_err(&data->client->dev, "The firmware update failed(%d)\n", error);
@@ -3376,6 +3386,12 @@ static int mxt_probe(struct i2c_client *client, const struct i2c_device_id *id)
 			return PTR_ERR(pdata);
 	}
 
+	maxtouch_wq = create_singlethread_workqueue("maxtouch_wq");
+        if (!maxtouch_wq) {
+                dev_err(&client->dev, "create_singlethread_workqueue error\n");
+                return -ENOMEM;
+        }
+
 	data = kzalloc(sizeof(struct mxt_data), GFP_KERNEL);
 	if (!data) {
 		dev_err(&client->dev, "Failed to allocate memory\n");
@@ -3401,6 +3417,8 @@ static int mxt_probe(struct i2c_client *client, const struct i2c_device_id *id)
 	init_completion(&data->crc_completion);
 	mutex_init(&data->debug_msg_lock);
 
+	INIT_WORK(&data->work_upgrade, mxt_force_updating);
+
 	error = request_threaded_irq(client->irq, NULL, mxt_interrupt,
 				     pdata->irqflags | IRQF_ONESHOT,
 				     client->name, data);
@@ -3409,9 +3427,9 @@ static int mxt_probe(struct i2c_client *client, const struct i2c_device_id *id)
 		goto err_free_mem;
 	}
 
-	mxt_probe_regulators(data);
-
 	disable_irq(data->irq);
+
+	mxt_probe_regulators(data);
 
 	error = sysfs_create_group(&client->dev.kobj, &mxt_attr_group);
 	if (error) {
@@ -3453,15 +3471,7 @@ static int mxt_probe(struct i2c_client *client, const struct i2c_device_id *id)
 	if (error)
 		goto err_remove_mem_access;
 
-	/*
-	 * bootloader is up and running; apps mode can't be recoverred.
-	 * this might be caused by flashing firmware in previous and somehow fails
-	 * we try to recovery it by flashing firmware and then re-start mxt_initialize
-	 */
-	if (data->in_bootloader)
-		data->force_update = 1;
-
-	async_schedule(mxt_force_updating, data);
+	queue_work(maxtouch_wq, &data->work_upgrade);
 
 	return 0;
 
@@ -3474,6 +3484,9 @@ err_free_irq:
 	free_irq(client->irq, data);
 err_free_mem:
 	kfree(data);
+	destroy_workqueue(maxtouch_wq);
+	maxtouch_wq = NULL;
+
 	return error;
 }
 
@@ -3499,6 +3512,8 @@ static int mxt_remove(struct i2c_client *client)
 	mxt_free_input_device(data);
 	mxt_free_object_table(data);
 	kfree(data);
+	destroy_workqueue(maxtouch_wq);
+	maxtouch_wq = NULL;
 
 	return 0;
 }
