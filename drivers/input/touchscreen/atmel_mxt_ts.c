@@ -13,7 +13,7 @@
  * option) any later version.
  *
  */
-
+#define DEBUG
 #include <linux/module.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
@@ -52,8 +52,10 @@
 #define MXT_FW_VER		0xAA
 
 /* Config file */
-#define MXT_CONFIG_NAME		"maxtouch.cfg"
-#define MXT_CONFIG_CRC		0x000000
+#define MXT_CONFIG1_NAME	"maxtouch1.cfg"
+#define MXT_CONFIG2_NAME	"maxtouch2.cfg"
+#define MXT_CONFIG1_CRC		0x000000
+#define MXT_CONFIG2_CRC		0x000000
 
 /* Configuration file */
 #define MXT_CFG_MAGIC		"OBP_RAW V1"
@@ -135,6 +137,27 @@ struct t7_config {
 #define MXT_T9_RELEASE		(1 << 5)
 #define MXT_T9_PRESS		(1 << 6)
 #define MXT_T9_DETECT		(1 << 7)
+
+/* MXT_GEN_COMMAND_T19 fied */
+#define MXT_T19_COMMAND_CTRL	0
+#define MXT_T19_COMMAND_REPORTMASK 1
+#define MXT_T19_COMMAND_DIR	2
+#define MXT_T19_COMMAND_INTPULLUP 3
+#define MXT_T19_COMMAND_OUT	4
+#define MXT_T19_COMMAND__WAKE	5
+
+#define MXT_T19_ENABLE	(1 << 0)
+#define MXT_T19_PRTEN	(1 << 1)
+#define MXT_T19_FORCERPT (1 << 2)
+
+/* MXT_T19 status */
+#define MXT_T19_GPIO0	(1 << 0)
+#define MXT_T19_GPIO1	(1 << 1)
+#define MXT_T19_GPIO2	(1 << 2)
+#define MXT_T19_GPIO3	(1 << 3)
+#define MXT_T19_GPIO4	(1 << 4)
+#define MXT_T19_GPIO5	(1 << 5)
+#define MXT_T19_GPIO6	(1 << 6)
 
 struct t9_range {
 	u16 x;
@@ -306,6 +329,7 @@ struct mxt_data {
 	u8 T15_reportid_max;
 	u16 T18_address;
 	u8 T19_reportid;
+	u16 T19_address;
 	u8 T42_reportid_min;
 	u8 T42_reportid_max;
 	u16 T44_address;
@@ -341,6 +365,7 @@ struct mxt_data {
 	char *cfg_name;
 	struct work_struct work_upgrade;
 	bool force_upgrade;
+	u32 cfg_crc;
 };
 
 static size_t mxt_obj_size(const struct mxt_object *obj)
@@ -1169,6 +1194,97 @@ static void mxt_proc_t63_messages(struct mxt_data *data, u8 *msg)
 	mxt_input_sync(data);
 }
 
+static int mxt_t19_command(struct mxt_data *data, u16 cmd_offset,
+			  u8 value, bool wait)
+{
+	u16 reg;
+	u8 command_register;
+	int timeout_counter = 0;
+	int ret;
+
+	reg = data->T19_address + cmd_offset;
+
+	ret = mxt_write_reg(data->client, reg, value);
+	if (ret)
+		return ret;
+
+	if (!wait)
+		return 0;
+
+	do {
+		msleep(20);
+		ret = __mxt_read_reg(data->client, reg, 1, &command_register);
+		if (ret)
+			return ret;
+	} while (command_register != 0 && timeout_counter++ <= 100);
+
+	if (timeout_counter > 100) {
+		dev_err(&data->client->dev, "Command failed!\n");
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int mxt_gpio_report_enable(struct mxt_data *data)
+{
+	struct device *dev = &data->client->dev;
+	int ret = 0;
+
+	dev_info(dev, "Enable GPIO report\n");
+
+	ret = mxt_t19_command(data, MXT_T19_COMMAND_CTRL,
+				MXT_T19_ENABLE|MXT_T19_PRTEN, false);
+
+	ret = mxt_t19_command(data, MXT_T19_COMMAND_REPORTMASK,
+				MXT_T19_GPIO6, false);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static int mxt_gpio_report_disable(struct mxt_data *data)
+{
+        struct device *dev = &data->client->dev;
+        int ret = 0;
+
+        dev_info(dev, "Disable GPIO report\n");
+
+        ret = mxt_t19_command(data, MXT_T19_COMMAND_CTRL,
+                                0, false);
+
+        if (ret)
+                return ret;
+
+        return 0;
+}
+
+static void mxt_gpio_report(struct mxt_data *data, u8 *message)
+{
+	u8 gpio;
+	gpio = message[1];
+
+	dev_info(&data->client->dev, "GPIO 0x%x",gpio);
+
+	mxt_gpio_report_disable(data);
+
+	/* TODO
+	Assign CFG name according to GPIO6 level
+	*/
+	if (gpio & 0x40) {
+		data->cfg_name = MXT_CONFIG1_NAME;
+		data->cfg_crc = MXT_CONFIG1_CRC;
+	}
+	else {
+		data->cfg_name = MXT_CONFIG2_NAME;
+		data->cfg_crc = MXT_CONFIG2_CRC;
+	}
+
+	if (maxtouch_wq)
+		queue_work(maxtouch_wq, &data->work_upgrade);
+}
+
 static int mxt_proc_message(struct mxt_data *data, u8 *message)
 {
 	u8 report_id = message[0];
@@ -1197,8 +1313,7 @@ static int mxt_proc_message(struct mxt_data *data, u8 *message)
 	    && report_id <= data->T100_reportid_max) {
 		mxt_proc_t100_message(data, message);
 	} else if (report_id == data->T19_reportid) {
-		mxt_input_button(data, message);
-		data->update_input = true;
+		mxt_gpio_report(data, message);
 	} else if (report_id >= data->T63_reportid_min
 		   && report_id <= data->T63_reportid_max) {
 		mxt_proc_t63_messages(data, message);
@@ -1861,6 +1976,7 @@ static void mxt_free_object_table(struct mxt_data *data)
 	data->T15_reportid_max = 0;
 	data->T18_address = 0;
 	data->T19_reportid = 0;
+	data->T19_address = 0;
 	data->T42_reportid_min = 0;
 	data->T42_reportid_max = 0;
 	data->T44_address = 0;
@@ -1951,6 +2067,7 @@ static int mxt_parse_object_table(struct mxt_data *data,
 			break;
 		case MXT_SPT_GPIOPWM_T19:
 			data->T19_reportid = min_id;
+			data->T19_address = object->start_address;
 			break;
 		case MXT_PROCG_NOISESUPPRESSION_T48:
 			data->T48_reportid = min_id;
@@ -2506,12 +2623,6 @@ err_free_mem:
 static int mxt_configure_objects(struct mxt_data *data,
 				 const struct firmware *cfg);
 
-static void mxt_config_cb(const struct firmware *cfg, void *ctx)
-{
-	mxt_configure_objects(ctx, cfg);
-	release_firmware(cfg);
-}
-
 static int mxt_initialize(struct mxt_data *data)
 {
 	struct i2c_client *client = data->client;
@@ -2554,6 +2665,7 @@ static int mxt_initialize(struct mxt_data *data)
 	if (error)
 		goto err_free_object_table;
 
+	error = mxt_gpio_report_enable(data);
 	error = mxt_acquire_irq(data);
 	if (error)
 		goto err_free_object_table;
@@ -3053,7 +3165,7 @@ static void mxt_force_updating(struct work_struct *work)
 	struct mxt_data *data =
 			container_of(work,
 				struct mxt_data, work_upgrade);
-	u8 fw_info;
+	u8 fw_info = 0;
 	int error;
 
 	if (data->info != NULL)
@@ -3063,7 +3175,6 @@ static void mxt_force_updating(struct work_struct *work)
 		data->force_upgrade = 1;
 
 	data->fw_name = MXT_FW_NAME;
-	data->cfg_name = MXT_CONFIG_NAME;
 
 	if (data->force_upgrade || fw_info < MXT_FW_VER) {
 		error = mxt_load_fw(&data->client->dev);
@@ -3076,14 +3187,16 @@ static void mxt_force_updating(struct work_struct *work)
 		}
 	}
 
-	disable_irq(data->irq);
+	mxt_update_crc(data, MXT_COMMAND_REPORTALL, 1);
 
-	error = mxt_load_cfg(&data->client->dev);
-	if (error) {
-		dev_err(&data->client->dev, "The config update failed(%d)\n", error);
+	if (data->config_crc != data->cfg_crc) {
+		disable_irq(data->irq);
+		error = mxt_load_cfg(&data->client->dev);
+		if (error) {
+			dev_err(&data->client->dev, "The config update failed(%d)\n", error);
+		}
+		enable_irq(data->irq);
 	}
-
-	enable_irq(data->irq);
 }
 
 static ssize_t mxt_debug_enable_show(struct device *dev,
@@ -3471,7 +3584,6 @@ static int mxt_probe(struct i2c_client *client, const struct i2c_device_id *id)
 	if (error)
 		goto err_remove_mem_access;
 
-	queue_work(maxtouch_wq, &data->work_upgrade);
 
 	return 0;
 
