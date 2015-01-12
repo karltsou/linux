@@ -3076,14 +3076,15 @@ static void mxt_force_updating(struct work_struct *work)
 		}
 	}
 
-	disable_irq(data->irq);
-
-	error = mxt_load_cfg(&data->client->dev);
-	if (error) {
-		dev_err(&data->client->dev, "The config update failed(%d)\n", error);
-	}
-
-	enable_irq(data->irq);
+	mxt_update_crc(data, MXT_COMMAND_REPORTALL, 1);
+        if (data->config_crc != MXT_CONFIG_CRC) {
+                disable_irq(data->irq);
+                error = mxt_load_cfg(&data->client->dev);
+                if (error) {
+                        dev_err(&data->client->dev, "The config update failed(%d)\n", error);
+                }
+                enable_irq(data->irq);
+        }
 }
 
 static ssize_t mxt_debug_enable_show(struct device *dev,
