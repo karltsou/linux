@@ -1263,7 +1263,7 @@ static int mxt_gpio_report_disable(struct mxt_data *data)
 static void mxt_gpio_report(struct mxt_data *data, u8 *message)
 {
 	u8 gpio;
-	gpio = message[1];
+	gpio = message[0];
 
 	dev_info(&data->client->dev, "GPIO 0x%x",gpio);
 
