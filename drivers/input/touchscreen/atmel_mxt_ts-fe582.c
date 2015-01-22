@@ -104,6 +104,7 @@ struct t7_config {
 
 #define MXT_POWER_CFG_RUN		0
 #define MXT_POWER_CFG_DEEPSLEEP		1
+#define MXT_POWER_CFG_SAVE		2
 
 /* MXT_TOUCH_MULTI_T9 field */
 #define MXT_T9_ORIENT		9
@@ -999,6 +1000,10 @@ static void mxt_proc_t93_messages(struct mxt_data *data, u8 *msg)
 	u8 status = msg[0];
 
 	dev_info(dev, "T93 double tap %d\n", status);
+
+	// Power key
+	input_report_key(data->input_dev, 26, 1);
+	input_sync(data->input_dev);
 }
 
 static void mxt_input_button(struct mxt_data *data, u8 *message)
@@ -1576,6 +1581,23 @@ static irqreturn_t mxt_interrupt(int irq, void *dev_id)
 		}
 	}
 	return IRQ_HANDLED;
+}
+
+static int mxt_t93_command(struct mxt_data *data, u16 cmd_offset,
+			  u8 value)
+{
+	u16 reg;
+	u8 command_register;
+	int timeout_counter = 0;
+	int ret;
+
+	reg = data->T93_address + cmd_offset;
+
+	ret = mxt_write_reg(data->client, reg, value);
+	if (ret)
+		return ret;
+
+	return 0;
 }
 
 static int mxt_t6_command(struct mxt_data *data, u16 cmd_offset,
@@ -2772,7 +2794,10 @@ static int mxt_initialize_t100_input_device(struct mxt_data *data)
 			     0, data->max_x, 0, 0);
 	input_set_abs_params(input_dev, ABS_MT_POSITION_Y,
 			     0, data->max_y, 0, 0);
-	
+
+	if (data->T93_address)
+		input_set_capability(input_dev, EV_KEY, 26);
+
 	if (data->T107_address) {
 		input_set_capability(input_dev, EV_KEY, BTN_STYLUS);
 		input_set_capability(input_dev, EV_KEY, BTN_STYLUS2);
@@ -2894,9 +2919,14 @@ static int mxt_set_t7_power_cfg(struct mxt_data *data, u8 sleep)
 	int error;
 	struct t7_config *new_config;
 	struct t7_config deepsleep = { .active = 0, .idle = 0 };
+	/* TODO
+	*/
+	struct t7_config powersave = { .active = 100, .idle = 200 };
 
 	if (sleep == MXT_POWER_CFG_DEEPSLEEP)
 		new_config = &deepsleep;
+	else if (sleep == MXT_POWER_CFG_SAVE)
+		new_config = &powersave;
 	else
 		new_config = &data->t7_cfg;
 
@@ -3642,7 +3672,6 @@ static void mxt_start(struct mxt_data *data)
 
 	if (data->use_regulator) {
 		enable_irq(data->irq);
-
 		mxt_regulator_enable(data);
 	} else {
 		/*
@@ -3655,6 +3684,12 @@ static void mxt_start(struct mxt_data *data)
 
 		/* Recalibrate since chip has been in deep sleep */
 		mxt_t6_command(data, MXT_COMMAND_CALIBRATE, 1, false);
+
+		/* Disable double tap wakeup */
+		if (data->T93_address) {
+			mxt_t93_command(data, 0, 0);
+			mxt_t93_command(data, 1, 0);
+		}
 
 		mxt_acquire_irq(data);
 	}
@@ -3669,10 +3704,16 @@ static void mxt_stop(struct mxt_data *data)
 
 	disable_irq(data->irq);
 
+	/* Enable double tap wakeup */
+	if (data->T93_address) {
+		mxt_t93_command(data, 0, 1);
+		mxt_t93_command(data, 1, 1);
+	}
+
 	if (data->use_regulator)
 		mxt_regulator_disable(data);
 	else
-		mxt_set_t7_power_cfg(data, MXT_POWER_CFG_DEEPSLEEP);
+		mxt_set_t7_power_cfg(data, MXT_POWER_CFG_SAVE);
 
 	mxt_reset_slots(data);
 	data->suspended = true;
@@ -3977,52 +4018,33 @@ static int mxt_remove(struct i2c_client *client)
 #ifdef CONFIG_PM_SLEEP
 static int mxt_suspend(struct device *dev)
 {
-	printk("[Atmel] mxt_suspend \n");
-	
-	if(touch_ic_status == true){
-		struct i2c_client *client = to_i2c_client(dev);
-		struct mxt_data *data = i2c_get_clientdata(client);
-		struct input_dev *input_dev = data->input_dev;
+	struct i2c_client *client = to_i2c_client(dev);
+	struct mxt_data *data = i2c_get_clientdata(client);
+	struct input_dev *input_dev = data->input_dev;
 
-		/*mutex_lock(&input_dev->mutex);
+	mutex_lock(&input_dev->mutex);
 
-		if (input_dev->users)
-			mxt_stop(data);
-		
-		mutex_unlock(&input_dev->mutex);
-		
-		if((data->suspend_poweroff == 1 )&& (build_version != 1)){
-			mxt_gpio_poweroff();
-		}*/
-	}
-		
+	if (input_dev->users)
+		mxt_stop(data);
+
+	mutex_unlock(&input_dev->mutex);
+
 	return 0;
 }
 
 static int mxt_resume(struct device *dev)
 {
-	printk("[Atmel] mxt_resume \n");
-	
-	if(touch_ic_status == true){
-		
-		struct i2c_client *client = to_i2c_client(dev);
-		struct mxt_data *data = i2c_get_clientdata(client);
-		struct input_dev *input_dev = data->input_dev;
-		
-		/*if((data->suspend_poweroff == 1 )&& (build_version != 1)){
-			mxt_gpio_poweron();
-		}
-		
-		mdelay(50);
-		
-		mutex_lock(&input_dev->mutex);
+	struct i2c_client *client = to_i2c_client(dev);
+	struct mxt_data *data = i2c_get_clientdata(client);
+	struct input_dev *input_dev = data->input_dev;
 
-		if (input_dev->users)
-			mxt_start(data);
-		
-		mutex_unlock(&input_dev->mutex);*/
-	}
-	
+	mutex_lock(&input_dev->mutex);
+
+	if (input_dev->users)
+		mxt_start(data);
+
+	mutex_unlock(&input_dev->mutex);*/
+
 	return 0;
 }
 
