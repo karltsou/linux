@@ -76,7 +76,24 @@
 #define MXT_PROCI_ACTIVE_STYLUS_T63	63
 #define MXT_TOUCH_MULTITOUCHSCREEN_T100 100
 #define MXT_PROCI_ACTIVESTYLUS_T107	107
-#define MXT_PROCI_TOUCHSEQUENCELOGGER_T93  93
+#define MXT_PROC_SYMBOLGESTUREPROCESSOR_T92 92
+#define MXT_PROCI_TOUCHSEQUENCELOGGER_T93   93
+
+/* MXT T92 status */
+#define MXT_T92_ENABLE   = 1,
+#define MXT_T92_DISABLE  = 2,
+
+/* MXT T92 Configuration */
+#define MXT_T92_CTRL_ENABLE  (1 << 0)
+#define MXT_T92_CTRL_RPTEN   (1 << 1)
+
+/* MXT T93 status */
+#define MXT_T93_ENABLE   = 1,
+#define MXT_T93_DISABLE  = 2,
+
+/* MXT T93 Configuration */
+#define MXT_T93_CTRL_ENABLE  (1 << 0)
+#define MXT_T93_CTRL_RPTEN   (1 << 1)
 
 /* MXT_GEN_MESSAGE_T5 object */
 #define MXT_RPTID_NOMSG		0xff
@@ -150,11 +167,11 @@ struct t9_range {
 /* T63 Stylus */
 #define MXT_T63_STYLUS_PRESS	(1 << 0)
 #define MXT_T63_STYLUS_RELEASE	(1 << 1)
-#define MXT_T63_STYLUS_MOVE		(1 << 2)
+#define MXT_T63_STYLUS_MOVE	(1 << 2)
 #define MXT_T63_STYLUS_SUPPRESS	(1 << 3)
 
 #define MXT_T63_STYLUS_DETECT	(1 << 4)
-#define MXT_T63_STYLUS_TIP		(1 << 5)
+#define MXT_T63_STYLUS_TIP	(1 << 5)
 #define MXT_T63_STYLUS_ERASER	(1 << 6)
 #define MXT_T63_STYLUS_BARREL	(1 << 7)
 
@@ -178,9 +195,9 @@ struct t9_range {
 #define MXT_T100_TYPE_STYLUS	0x20
 
 enum t100_type {
-	MXT_T100_TYPE_FINGER			= 1,
+	MXT_T100_TYPE_FINGER		= 1,
 	MXT_T100_TYPE_PASSIVE_STYLUS	= 2,
-	MXT_T100_TYPE_ACTIVE_STYLUS		= 3,
+	MXT_T100_TYPE_ACTIVE_STYLUS	= 3,
 };
 
 /* Gen2 Active Stylus */
@@ -348,11 +365,13 @@ struct mxt_data {
 	u8 T48_reportid;
 	u8 T63_reportid_min;
 	u8 T63_reportid_max;
+	u16 T92_address;
+	u8 T92_reported;
+	u16 T93_address;
+	u8 T93_reportid;
 	u8 T100_reportid_min;
 	u8 T100_reportid_max;
 	u16 T107_address;
-	u16 T93_address;
-	u8 T93_reportid;
 #ifdef CONFIG_HAS_EARLYSUSPEND
 	struct early_suspend early_suspend;
 #endif
@@ -994,6 +1013,21 @@ static void mxt_proc_t6_messages(struct mxt_data *data, u8 *msg)
 	data->t6_status = status;
 }
 
+static void mxt_proc_t92_messages(struct mxt_data *data, u8 *msg)
+{
+	struct device *dev = &data->client->dev;
+	u8 status = msg[0];
+
+	if (status & 0x80)
+		dev_info(dev, "T92 symbol reports 0x%x\n", status & 0x7f);
+	else
+		dev_info(dev, "T92 long storke reports 0x%x\n", status & 0x0f);
+
+	// Power key
+        input_report_key(data->input_dev, 26, 1);
+        input_sync(data->input_dev);
+}
+
 static void mxt_proc_t93_messages(struct mxt_data *data, u8 *msg)
 {
 	struct device *dev = &data->client->dev;
@@ -1394,6 +1428,8 @@ static int mxt_proc_message(struct mxt_data *data, u8 *message)
 	} else if (report_id >= data->T15_reportid_min
 		   && report_id <= data->T15_reportid_max) {
 		mxt_proc_t15_messages(data, message);
+	} else if (report_id == data->T92_reportid) {
+		mxt_proc_t92_messages(data, message);
 	} else if (report_id == data->T93_reportid) {
 		mxt_proc_t93_messages(data, message);
 	} else {
@@ -1583,17 +1619,50 @@ static irqreturn_t mxt_interrupt(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-static int mxt_t93_command(struct mxt_data *data, u16 cmd_offset,
-			  u8 value)
+static int mxt_t92_configuration(struct mxt_data *data, u16 cmd_offset,
+				u8 status)
 {
 	u16 reg;
 	u8 command_register;
-	int timeout_counter = 0;
+	int ret;
+
+	reg = data->T92_address + cmd_offset;
+
+	ret = __mxt_read_reg(data->client, reg, 1, &command_register);
+	if (ret)
+		return ret;
+
+	if (status == MXT_T92_ENABLE)
+		command_register |= (MXT_T92_CTRL_ENABLE|MXT_T92_CTRL_RPTEN);
+	if (status == MXT_T92_DISABLE)
+		command_register &= ~(MXT_T92_CTRL_ENABLE|MXT_T92_CTRL_RPTEN);
+
+	ret = mxt_write_reg(data->client, reg, command_register);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static int mxt_t93_configuration(struct mxt_data *data, u16 cmd_offset,
+				u8 status)
+{
+	u16 reg;
+	u8 command_register;
 	int ret;
 
 	reg = data->T93_address + cmd_offset;
 
-	ret = mxt_write_reg(data->client, reg, value);
+	ret = __mxt_read_reg(data->client, reg, 1, &command_register);
+	if (ret)
+		return ret;
+
+	if (status == MXT_T93_ENABLE)
+		command_register |= (MXT_T93_CTRL_ENABLE|MXT_T93_CTRL_RPTEN);
+	if (status == MXT_T93_DISABLE)
+		command_register &= ~(MXT_T93_CTRL_ENABLE|MXT_T93_CTRL_RPTEN);
+
+	ret = mxt_write_reg(data->client, reg, command_register);
 	if (ret)
 		return ret;
 
@@ -2138,10 +2207,11 @@ static void mxt_free_object_table(struct mxt_data *data)
 	data->T44_address = 0;
 	data->T48_reportid = 0;
 	data->T63_reportid_min = 0;
+	data->T63_reportid_max = 0;
+	data->T92_address = 0;
+	data->T92_reportid = 0;
 	data->T93_address = 0;
 	data->T93_reportid = 0;
-	data->T63_reportid_max = 0;
-	data->T100_reportid_min = 0;
 	data->T100_reportid_max = 0;
 	data->max_reportid = 0;
 }
@@ -2234,6 +2304,10 @@ static int mxt_parse_object_table(struct mxt_data *data,
 			data->T63_reportid_min = min_id;
 			data->T63_reportid_max = min_id;
 			data->num_stylusids = 1;
+			break;
+		case MXT_PROC_SYMBOLGESTUREPROCESSOR_T92:
+			data->T92_address = object->start_address;
+			data->T92_reportid = min_id;
 			break;
 		case MXT_PROCI_TOUCHSEQUENCELOGGER_T93:
 			data->T93_address = object->start_address;
@@ -2795,7 +2869,7 @@ static int mxt_initialize_t100_input_device(struct mxt_data *data)
 	input_set_abs_params(input_dev, ABS_MT_POSITION_Y,
 			     0, data->max_y, 0, 0);
 
-	if (data->T93_address)
+	if (data->T92_address || data->T93_address)
 		input_set_capability(input_dev, EV_KEY, 26);
 
 	if (data->T107_address) {
@@ -3685,10 +3759,14 @@ static void mxt_start(struct mxt_data *data)
 		/* Recalibrate since chip has been in deep sleep */
 		mxt_t6_command(data, MXT_COMMAND_CALIBRATE, 1, false);
 
-		/* Disable double tap wakeup */
+		/* Disable double tap and report messages */
 		if (data->T93_address) {
-			mxt_t93_command(data, 0, 0);
-			mxt_t93_command(data, 1, 0);
+			mxt_t93_configuration(data, 0, MXT_T93_DISABLE);
+		}
+
+		/* Disable gesture and report messages */
+		if (data->T92_address) {
+			mxt_t92_configuration(data, 0, MXT_T93_DISABLE);
 		}
 
 		mxt_acquire_irq(data);
@@ -3704,10 +3782,14 @@ static void mxt_stop(struct mxt_data *data)
 
 	disable_irq(data->irq);
 
-	/* Enable double tap wakeup */
+	/* Enable double tap and report messages */
 	if (data->T93_address) {
-		mxt_t93_command(data, 0, 1);
-		mxt_t93_command(data, 1, 1);
+		mxt_t93_configuration(data, 0, MXT_T93_ENABLE);
+	}
+
+	/* Enable gesture and report messages */
+	if (data->T92_address) {
+		mxt_t92_configuration(data, 0, MXT_T92_ENABLE);
 	}
 
 	if (data->use_regulator)
