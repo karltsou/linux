@@ -1016,12 +1016,12 @@ static void mxt_proc_t6_messages(struct mxt_data *data, u8 *msg)
 static void mxt_proc_t92_messages(struct mxt_data *data, u8 *msg)
 {
 	struct device *dev = &data->client->dev;
-	u8 status = msg[0];
+	u8 symbol = msg[1];
 
-	if (status & 0x80)
-		dev_info(dev, "T92 symbol reports 0x%x\n", status & 0x7f);
+	if (symbol & 0x80)
+		dev_info(dev, "T92 symbol reports 0x%x\n", symbol & 0x7f);
 	else
-		dev_info(dev, "T92 long storke reports 0x%x\n", status & 0x0f);
+		dev_info(dev, "T92 long storke reports 0x%x\n", symbol & 0x0f);
 
 	// Power key
         input_report_key(data->input_dev, 26, 1);
