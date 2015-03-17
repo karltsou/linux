@@ -121,8 +121,10 @@ struct t7_config {
 
 #define MXT_POWER_CFG_RUN		0
 #define MXT_POWER_CFG_DEEPSLEEP		1
-#define MXT_POWER_CFG_SAVE		2
+#define MXT_POWER_CFG_POWERSAVE		2
 
+#define MXT_SENSING_MUTUALTCH		1
+#define MXT_SENSING_SELFTCH		2
 /* MXT_TOUCH_MULTI_T9 field */
 #define MXT_T9_ORIENT		9
 #define MXT_T9_RANGE		18
@@ -353,6 +355,7 @@ struct mxt_data {
 	u8 T6_reportid;
 	u16 T6_address;
 	u16 T7_address;
+	u16 T8_address;
 	u8 T9_reportid_min;
 	u8 T9_reportid_max;
 	u8 T15_reportid_min;
@@ -2196,6 +2199,7 @@ static void mxt_free_object_table(struct mxt_data *data)
 	data->T5_msg_size = 0;
 	data->T6_reportid = 0;
 	data->T7_address = 0;
+	data->T8_address = 0;
 	data->T9_reportid_min = 0;
 	data->T9_reportid_max = 0;
 	data->T15_reportid_min = 0;
@@ -2271,6 +2275,9 @@ static int mxt_parse_object_table(struct mxt_data *data,
 			break;
 		case MXT_GEN_POWER_T7:
 			data->T7_address = object->start_address;
+			break;
+		MXT_GEN_ACQUIRE_T8:
+			data->T8_address = object->start_address;
 			break;
 		case MXT_TOUCH_MULTI_T9:
 			/* Only handle messages from first T9 instance */
@@ -2987,6 +2994,28 @@ err_free_object_table:
 	return error;
 }
 
+static int mxt_set_t8_acquisition_cfg(struct mxt_data *data,
+					u16 cmd_offset, u8 type)
+{
+	u16 reg;
+        u8 command_register;
+        int ret;
+
+        reg = data->T8_address + cmd_offset;
+
+	if (type == MXT_SENSING_MUTUALTCH)
+		command_register = 0x01;
+	else if (type == MXT_SENSING_MUTUALTCH)
+		command_register = 0x02;
+	else
+		command_register = 0x03;
+
+        ret = mxt_write_reg(data->client, reg, command_register);
+        if (ret)
+                return ret;
+
+        return 0;
+}
 static int mxt_set_t7_power_cfg(struct mxt_data *data, u8 sleep)
 {
 	struct device *dev = &data->client->dev;
@@ -2999,7 +3028,7 @@ static int mxt_set_t7_power_cfg(struct mxt_data *data, u8 sleep)
 
 	if (sleep == MXT_POWER_CFG_DEEPSLEEP)
 		new_config = &deepsleep;
-	else if (sleep == MXT_POWER_CFG_SAVE)
+	else if (sleep == MXT_POWER_CFG_POWERSAVE)
 		new_config = &powersave;
 	else
 		new_config = &data->t7_cfg;
@@ -3035,8 +3064,8 @@ recheck:
 			goto recheck;
 		} else {
 			dev_dbg(dev, "T7 cfg zero after reset, overriding\n");
-			data->t7_cfg.active = 20;
-			data->t7_cfg.idle = 100;
+			data->t7_cfg.active = 7;
+			data->t7_cfg.idle = 20;
 			return mxt_set_t7_power_cfg(data, MXT_POWER_CFG_RUN);
 		}
 	}
@@ -3754,10 +3783,8 @@ static void mxt_start(struct mxt_data *data)
 		 */
 		mxt_process_messages_until_invalid(data);
 
-		mxt_set_t7_power_cfg(data, MXT_POWER_CFG_RUN);
-
-		/* Recalibrate since chip has been in deep sleep */
-		mxt_t6_command(data, MXT_COMMAND_CALIBRATE, 1, false);
+		/* Restore to default configurattion setting */
+		mxt_t6_command(data, MXT_COMMAND_RESET, MXT_RESET_VALUE, false);
 
 		/* Disable double tap and report messages */
 		if (data->T93_address) {
@@ -3794,9 +3821,11 @@ static void mxt_stop(struct mxt_data *data)
 
 	if (data->use_regulator)
 		mxt_regulator_disable(data);
-	else
+	else {
+		mxt_set_t8_acquisition_cfg(data, 10,
+			 (MXT_SENSING_MUTUALTCH | MXT_SENSING_SELFTCH));
 		mxt_set_t7_power_cfg(data, MXT_POWER_CFG_SAVE);
-
+	}
 	mxt_reset_slots(data);
 	data->suspended = true;
 }
